@@ -6,9 +6,11 @@ import android.net.Uri
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedWriter
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 import java.net.URLConnection
 import java.util.UUID
@@ -171,32 +173,31 @@ object RikkaHubTransferWriter {
                 val conversationTable = tables.firstOrNull { it.equals("conversationentity", true) }
                     ?: error("ConversationEntity table not found")
                 val nodeTable = tables.firstOrNull { it.equals("message_node", true) }
-                val nodesByConversation = if (nodeTable != null) {
-                    readNodes(database, nodeTable, warnings)
-                } else {
-                    emptyMap()
-                }
-                val conversations = readConversations(
+                if (nodeTable != null) readNodes(database, nodeTable, warnings)
+                val conversationsFile = File(staging, "conversations.json")
+                val conversationCount = writeConversations(
                     database = database,
                     table = conversationTable,
-                    nodesByConversation = nodesByConversation,
+                    nodeTable = nodeTable,
+                    output = conversationsFile,
                     warnings = warnings,
                     errors = errors,
                     attachments = attachments,
                 )
-                require(conversations.isNotEmpty()) { "No readable conversations found" }
+                require(conversationCount > 0) { "No readable conversations found" }
 
                 writePackage(
                     output = output,
                     databaseVersion = database.version,
                     tables = tables,
-                    conversations = conversations,
+                    conversationsFile = conversationsFile,
+                    conversationCount = conversationCount,
                     warnings = warnings,
                     errors = errors,
                     attachments = attachments.attachments.values.toList(),
                 )
                 ConversionSummary(
-                    conversationCount = conversations.size,
+                    conversationCount = conversationCount,
                     warningCount = warnings.distinct().size,
                     errorCount = errors.distinct().size,
                 )
@@ -211,6 +212,11 @@ object RikkaHubTransferWriter {
         val index: Int,
         val messages: String,
         val selectIndex: Int,
+    )
+
+    private data class NodeReadResult(
+        val nodeCount: Int,
+        val messageCount: Int,
     )
 
     private fun readTables(database: SQLiteDatabase): List<String> {
@@ -228,77 +234,125 @@ object RikkaHubTransferWriter {
         database: SQLiteDatabase,
         table: String,
         warnings: MutableList<String>,
-    ): Map<String, List<SourceNode>> {
+    ): NodeReadResult {
         val columns = readColumns(database, table)
         val conversationIdColumn = columns.firstOrNull { it.equals("conversation_id", true) }
-            ?: return emptyMap()
+            ?: return NodeReadResult(0, 0)
         val messagesColumn = columns.firstOrNull { it.equals("messages", true) }
-            ?: return emptyMap()
+            ?: return NodeReadResult(0, 0)
+        var nodeCount = 0
+        var messageCount = 0
+        database.query(table, null, null, null, null, null, null).use { cursor ->
+            while (cursor.moveToNext()) {
+                cursor.string(conversationIdColumn) ?: continue
+                val messages = cursor.string(messagesColumn) ?: continue
+                nodeCount++
+                messageCount += runCatching { JSONArray(messages).length() }.getOrDefault(0)
+            }
+        }
+        if (nodeCount == 0) warnings += "message_node table was present but contained no readable rows"
+        return NodeReadResult(nodeCount, messageCount)
+    }
+
+    private fun readNodesForConversation(
+        database: SQLiteDatabase,
+        table: String,
+        conversationId: String,
+    ): List<SourceNode> {
+        val columns = readColumns(database, table)
+        val conversationIdColumn = columns.firstOrNull { it.equals("conversation_id", true) }
+            ?: return emptyList()
+        val messagesColumn = columns.firstOrNull { it.equals("messages", true) }
+            ?: return emptyList()
         val idColumn = columns.firstOrNull { it.equals("id", true) } ?: "rowid"
         val indexColumn = columns.firstOrNull { it.equals("node_index", true) }
         val selectIndexColumn = columns.firstOrNull { it.equals("select_index", true) }
-        val result = linkedMapOf<String, MutableList<SourceNode>>()
-        database.query(table, null, null, null, null, null, null).use { cursor ->
-            while (cursor.moveToNext()) {
-                val conversationId = cursor.string(conversationIdColumn) ?: continue
-                val messages = cursor.string(messagesColumn) ?: continue
-                val node = SourceNode(
-                    id = cursor.string(idColumn) ?: "row-${cursor.position}",
-                    index = cursor.int(indexColumn) ?: cursor.position,
-                    messages = messages,
-                    selectIndex = cursor.int(selectIndexColumn) ?: 0,
-                )
-                result.getOrPut(conversationId) { mutableListOf() } += node
+        return buildList {
+            database.query(
+                table,
+                null,
+                "$conversationIdColumn = ?",
+                arrayOf(conversationId),
+                null,
+                null,
+                null,
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val messages = cursor.string(messagesColumn) ?: continue
+                    add(
+                        SourceNode(
+                            id = cursor.string(idColumn) ?: "row-${cursor.position}",
+                            index = cursor.int(indexColumn) ?: cursor.position,
+                            messages = messages,
+                            selectIndex = cursor.int(selectIndexColumn) ?: 0,
+                        )
+                    )
+                }
             }
-        }
-        if (result.isEmpty()) warnings += "message_node table was present but contained no readable rows"
-        return result.mapValues { (_, nodes) -> nodes.sortedBy { it.index } }
+        }.sortedBy { it.index }
     }
 
-    private fun readConversations(
+    private fun writeConversations(
         database: SQLiteDatabase,
         table: String,
-        nodesByConversation: Map<String, List<SourceNode>>,
+        nodeTable: String?,
+        output: File,
         warnings: MutableList<String>,
         errors: MutableList<String>,
         attachments: AttachmentCollector,
-    ): List<JSONObject> {
-        val result = mutableListOf<JSONObject>()
-        database.query(table, null, null, null, null, null, null).use { cursor ->
-            while (cursor.moveToNext()) {
-                val sourceId = cursor.string("id") ?: run {
-                    errors += "conversation row ${cursor.position} has no id"
-                    continue
-                }
-                val nodes = nodesByConversation[sourceId].orEmpty().mapNotNull { node ->
-                    normalizeNode(node, sourceId, warnings, errors, attachments)
-                }.toMutableList()
-                if (nodes.isEmpty()) {
-                    val legacyNodes = cursor.string("nodes")
-                    nodes += parseLegacyNodes(legacyNodes, sourceId, warnings, errors, attachments)
-                }
-                if (nodes.isEmpty()) {
-                    warnings += "conversation:$sourceId has no readable messages"
-                    continue
-                }
+    ): Int {
+        var convertedConversationCount = 0
+        var firstConversation = true
+        BufferedWriter(
+            OutputStreamWriter(FileOutputStream(output), StandardCharsets.UTF_8)
+        ).use { writer ->
+            writer.write("[")
+            database.query(table, null, null, null, null, null, null).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val sourceId = cursor.string("id") ?: run {
+                        errors += "conversation row ${cursor.position} has no id"
+                        continue
+                    }
+                    // ponytail: one conversation is still normalized in memory; stream individual nodes if that ceiling matters.
+                    val nodes = nodeTable?.let { nodeTableName ->
+                        readNodesForConversation(database, nodeTableName, sourceId)
+                            .mapNotNull { node ->
+                                normalizeNode(node, sourceId, warnings, errors, attachments)
+                            }
+                            .toMutableList()
+                    } ?: mutableListOf()
+                    if (nodes.isEmpty()) {
+                        val legacyNodes = cursor.string("nodes")
+                        nodes += parseLegacyNodes(legacyNodes, sourceId, warnings, errors, attachments)
+                    }
+                    if (nodes.isEmpty()) {
+                        warnings += "conversation:$sourceId has no readable messages"
+                        continue
+                    }
 
-                val now = System.currentTimeMillis()
-                val createAt = normalizeTimestamp(cursor.long("create_at") ?: now)
-                val updateAt = normalizeTimestamp(cursor.long("update_at") ?: createAt)
-                result += JSONObject().apply {
-                    put("id", stableUuid("conversation:$sourceId"))
-                    put("source_id", sourceId)
-                    put("title", cursor.string("title")?.takeIf { it.isNotBlank() } ?: sourceId)
-                    put("create_at", createAt)
-                    put("update_at", updateAt)
-                    put("custom_system_prompt", cursor.string("custom_system_prompt"))
-                    put("chat_suggestions", parseStringArray(cursor.string("suggestions")))
-                    put("is_pinned", cursor.int("is_pinned") == 1)
-                    put("message_nodes", JSONArray(nodes))
+                    val now = System.currentTimeMillis()
+                    val createAt = normalizeTimestamp(cursor.long("create_at") ?: now)
+                    val updateAt = normalizeTimestamp(cursor.long("update_at") ?: createAt)
+                    val conversation = JSONObject().apply {
+                        put("id", stableUuid("conversation:$sourceId"))
+                        put("source_id", sourceId)
+                        put("title", cursor.string("title")?.takeIf { it.isNotBlank() } ?: sourceId)
+                        put("create_at", createAt)
+                        put("update_at", updateAt)
+                        put("custom_system_prompt", cursor.string("custom_system_prompt"))
+                        put("chat_suggestions", parseStringArray(cursor.string("suggestions")))
+                        put("is_pinned", cursor.int("is_pinned") == 1)
+                        put("message_nodes", JSONArray(nodes))
+                    }
+                    if (!firstConversation) writer.write(",")
+                    writer.write(conversation.toString())
+                    firstConversation = false
+                    convertedConversationCount++
                 }
             }
+            writer.write("]")
         }
-        return result
+        return convertedConversationCount
     }
 
     private fun normalizeNode(
@@ -418,7 +472,8 @@ object RikkaHubTransferWriter {
         output: File,
         databaseVersion: Int,
         tables: List<String>,
-        conversations: List<JSONObject>,
+        conversationsFile: File,
+        conversationCount: Int,
         warnings: List<String>,
         errors: List<String>,
         attachments: List<AttachmentSource>,
@@ -431,7 +486,7 @@ object RikkaHubTransferWriter {
                 put("source_app", "RikkaHub")
                 put("source_version", JSONObject.NULL)
                 put("source_database_version", databaseVersion)
-                put("conversation_count", conversations.size)
+                put("conversation_count", conversationCount)
                 put("attachment_count", attachments.size)
                 put("attachments", JSONArray(attachments.map { attachment ->
                     JSONObject().apply {
@@ -444,7 +499,7 @@ object RikkaHubTransferWriter {
                 put("warnings", JSONArray(warnings.distinct()))
             }
             putEntry(zip, "manifest.json", manifest.toString(2))
-            putEntry(zip, "conversations.json", JSONArray(conversations).toString())
+            putFileEntry(zip, "conversations.json", conversationsFile)
             attachments.forEach { attachment ->
                 val entryName = "attachments/${attachment.id}"
                 if (attachment.file != null) {
