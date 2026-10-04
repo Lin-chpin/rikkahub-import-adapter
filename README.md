@@ -17,6 +17,7 @@
 
 - `manifest.json`，记录格式版本、来源信息、数量和警告。
 - `conversations.json`，记录标准化后的会话和消息节点。
+- `settings.json`，存在于上游备份时会一并保留，用于恢复助手、API 等设置；会话中的 `assistant_id` 也会一并转换。
 - `diagnostics.json`，记录来源数据库结构和转换诊断信息。
 
 应用的导入约定固定为 `rikkahub-transfer` 格式版本 `1`。上游数据库结构发生变化时，应在此适配器中处理，不要修改这个约定。无法识别或无法读取的数据行会被记录，不会被静默丢弃。
@@ -46,4 +47,4 @@ adapter.keyPassword=...
 gradle -p import-adapter :app:assembleRelease
 ```
 
-将 `import-adapter/app/build/outputs/apk/release/app-release.apk` 及其 SHA-256 值上传到 GitHub 发布页，例如 `adapter-v1.0.0`。适配器版本标签与主应用版本标签分开管理。
+将 `import-adapter/app/build/outputs/apk/release/app-release.apk` 及其 SHA-256 值上传到 GitHub 发布页，例如 `adapter-v1.0.3`。适配器版本标签与主应用版本标签分开管理。

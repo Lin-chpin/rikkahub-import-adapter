@@ -32,6 +32,7 @@ private data class StagedFile(
 private data class StagedBackup(
     val databaseFile: File,
     val files: List<StagedFile>,
+    val settingsFile: File?,
 )
 
 private fun stableImportUuid(value: String): String = UUID.nameUUIDFromBytes(
@@ -192,6 +193,7 @@ object RikkaHubTransferWriter {
                     tables = tables,
                     conversationsFile = conversationsFile,
                     conversationCount = conversationCount,
+                    settingsFile = stagedBackup.settingsFile,
                     warnings = warnings,
                     errors = errors,
                     attachments = attachments.attachments.values.toList(),
@@ -339,6 +341,7 @@ object RikkaHubTransferWriter {
                         put("title", cursor.string("title")?.takeIf { it.isNotBlank() } ?: sourceId)
                         put("create_at", createAt)
                         put("update_at", updateAt)
+                        cursor.string("assistant_id")?.takeIf(::isUuid)?.let { put("assistant_id", it) }
                         put("custom_system_prompt", cursor.string("custom_system_prompt"))
                         put("chat_suggestions", parseStringArray(cursor.string("suggestions")))
                         put("is_pinned", cursor.int("is_pinned") == 1)
@@ -474,6 +477,7 @@ object RikkaHubTransferWriter {
         tables: List<String>,
         conversationsFile: File,
         conversationCount: Int,
+        settingsFile: File?,
         warnings: List<String>,
         errors: List<String>,
         attachments: List<AttachmentSource>,
@@ -487,6 +491,7 @@ object RikkaHubTransferWriter {
                 put("source_version", JSONObject.NULL)
                 put("source_database_version", databaseVersion)
                 put("conversation_count", conversationCount)
+                put("complete_restore", settingsFile != null)
                 put("attachment_count", attachments.size)
                 put("attachments", JSONArray(attachments.map { attachment ->
                     JSONObject().apply {
@@ -500,6 +505,7 @@ object RikkaHubTransferWriter {
             }
             putEntry(zip, "manifest.json", manifest.toString(2))
             putFileEntry(zip, "conversations.json", conversationsFile)
+            settingsFile?.let { putFileEntry(zip, "settings.json", it) }
             attachments.forEach { attachment ->
                 val entryName = "attachments/${attachment.id}"
                 if (attachment.file != null) {
@@ -535,8 +541,9 @@ object RikkaHubTransferWriter {
     }
 
     private fun extractDatabase(input: File, staging: File): StagedBackup {
-        if (!isZip(input)) return StagedBackup(input, emptyList())
+        if (!isZip(input)) return StagedBackup(input, emptyList(), null)
         var databaseFile: File? = null
+        var settingsFile: File? = null
         val stagedFiles = mutableListOf<StagedFile>()
         val stagingRoot = staging.canonicalFile
         ZipInputStream(FileInputStream(input)).use { zip ->
@@ -552,11 +559,15 @@ object RikkaHubTransferWriter {
                 if (relativePath.substringAfterLast('/').equals("rikka_hub.db", true)) {
                     databaseFile = target
                 }
+                if (relativePath.substringAfterLast('/').equals("settings.json", true)) {
+                    settingsFile = target
+                }
             }
         }
         return StagedBackup(
             databaseFile = databaseFile ?: error("rikka_hub.db not found in selected backup"),
             files = stagedFiles,
+            settingsFile = settingsFile,
         )
     }
 
